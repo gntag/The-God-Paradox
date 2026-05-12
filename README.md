@@ -20,7 +20,7 @@ This experiment replicates that baseline exactly, then extends it by letting God
 - **Dividends**: Embedded in the real total return index — no separate DRIP is applied
 - **Nominal T-bill rate**: 1-year short rate (Shiller `chapt26.xlsx` pre-1962, FRED `DGS1.xlsx` 1962–2026)
 - **CPI**: Shiller `ie_data.xls` column E — single consistent source, full history 1871–2026
-- **Real T-bill rate**: Fisher equation — `(1 + nominal_BEY_eff) / (1 + trailing_12m_CPI) − 1`
+- **Real T-bill rate**: Fisher equation — `(1 + nominal_effective) / (1 + trailing_12m_CPI) − 1`
 - **Date range**: Jan 1920 – May 2026 (1,277 monthly observations)
 
 ---
@@ -56,10 +56,10 @@ The schedule is computed **once** on the full 1920–2026 series. Each rolling w
 God's idle cash earns the **Fisher-equation real T-bill rate**, keeping the cash yield in the same unit (real purchasing power) as the equity index:
 
 ```
-r_real = (1 + nominal_BEY_eff) / (1 + π_trailing_12m) − 1
+r_real = (1 + nominal_effective) / (1 + π_trailing_12m) − 1
 ```
 
-where `nominal_BEY_eff = (1 + BEY/2)² − 1` (BEY → annual effective) and `π_trailing_12m = CPI[t] / CPI[t−12] − 1`.
+where `π_trailing_12m = CPI[t] / CPI[t−12] − 1`. FRED `DGS1` is a bond-equivalent yield, so from 1962 onward `nominal_effective = (1 + DGS1/2)² − 1`. Shiller's pre-1962 one-year rate is already annual and is passed through as `nominal_effective`.
 
 CPI is sourced entirely from `ie_data.xls` — the same file as the price series. **Negative real rates are allowed**: during high-inflation periods God's idle cash genuinely loses real purchasing power, consistent with the historical experience of holding T-bills during the 1970s.
 
@@ -113,7 +113,7 @@ CPI is sourced entirely from `ie_data.xls` — the same file as the price series
 
 **Rolling windows tell the more nuanced story:** Windows starting in the 1940s–1960s capture the full stagflation era (where real rates were often negative) but miss the Depression deflation bonus. In those windows, God's cash shrinks in real terms while waiting, reducing the deployed war chest and cutting the win rate significantly.
 
-**God 10-Year (47%) loses to DCA in the majority of rolling windows:** Window-relative 10-year periods can expose the strategy to a full decade of weak or negative real cash returns before deployment, which is devastatingly punishing. The worst 10-Year window loses −32.3% to DCA; the median outcome is −1.9% (DCA wins on the median). The 5-Year strategy (70%) is far more robust because a 5-year wait through negative real rates is less damaging — the worst 5-Year window is only −13.2%.
+**God 10-Year (47%) loses to DCA in the majority of rolling windows:** Window-relative 10-year blocks can expose the strategy to a full 10-year block of weak or negative real cash returns before deployment, which is devastatingly punishing. The worst 10-Year window loses −32.3% to DCA; the median outcome is −1.9% (DCA wins on the median). The 5-Year strategy (70%) is far more robust because a 5-year wait through negative real rates is less damaging — the worst 5-Year window is only −13.2%.
 
 ---
 
@@ -151,7 +151,7 @@ jupyter notebook god_paradox.ipynb
 # Scenario A: full run (Jan 1920 – May 2026)
 python god_paradox.py
 
-# Scenario B: all 798 rolling windows (~3 minutes)
+# Scenario B: all 798 rolling windows (runtime depends on machine)
 python rolling_windows.py
 
 # Export results to Excel
