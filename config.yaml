@@ -1,0 +1,23 @@
+# ============================================================
+# The God Paradox — Experiment Configuration
+# ============================================================
+# All paths are relative to this file (The_God_Paradox/).
+# Copy this file to reproduce the experiment on any machine.
+# ============================================================
+
+paths:
+  data_dir:      "../S&P500"                              # folder containing price CSVs
+  nominal_csv:   "S&P500_normal_prices.csv"               # nominal S&P 500 monthly prices
+  dividend_xlsx: "sp500_dividend_yield_by_month_multpl.xlsx"  # monthly dividend yield
+  dgs1_xlsx:     "../Treasury_Yields/DGS1.xlsx"           # FRED 1-yr T-bill daily (1962+)
+  shiller_xlsx:  "../shiller_data/chapt26.xlsx"           # Shiller annual short rate (pre-1962)
+  charts_dir:    "charts"                                 # output folder for PNG charts
+  exports_dir:   "exports"                                # output folder for Excel files
+
+experiment:
+  start_date:           "1928-01-01"   # first month of the full-run experiment
+  monthly_contribution: 100.0          # USD contributed each month by both strategies
+  period_years:         10             # default God period (10 = classic decade); overridden explicitly for 5yr runs
+
+rolling_windows:
+  window_years:         40    # length of each rolling window (months = years × 12)
