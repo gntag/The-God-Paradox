@@ -1,419 +1,405 @@
 """
 The God Paradox
-==============
-Revisiting "Even God Couldn't Beat Dollar-Cost Averaging" with a stricter God.
+===============
+Canonical Shiller real-total-return implementation.
 
-Original experiment (of-dollars-and-data): God invests at every market bottom
-(inter all-time-high dip). Result: DCA wins ~70% of rolling 40-year windows.
-
-This experiment: God invests ONCE PER DECADE at the single lowest price of that
-decade. Cash accumulates at 0% between buys — identical assumption to the
-original. Both strategies invest $100/month from 1930 to 2026.
-
-Dividends are reinvested monthly (DRIP) for shares already held. God's idle
-cash earns no dividends — only invested shares compound with dividend yield.
-
-All tunable parameters live in config.yaml next to this file.
+Equity prices are Shiller's real total return S&P 500 index from
+ie_data.xls column J. Dividends and inflation adjustment are already embedded,
+so no separate dividend-yield series is applied.
 """
 
 from __future__ import annotations
 
-import yaml
-import pandas as pd
-import numpy as np
+from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
-# ---------------------------------------------------------------------------
-# Configuration — loaded once at import time
-# ---------------------------------------------------------------------------
+import numpy as np
+import pandas as pd
+import xlrd
+import yaml
+
+
 _CFG_FILE = Path(__file__).parent / "config.yaml"
 
 
 def load_config(path: Path = _CFG_FILE) -> dict:
-    """Load and return the YAML config dict."""
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 CFG = load_config()
+_BASE = _CFG_FILE.parent
 
-# Resolve all paths relative to the config file's directory
-_BASE         = _CFG_FILE.parent
-DATA_DIR      = (_BASE / CFG["paths"]["data_dir"]).resolve()
-NOMINAL_CSV   = DATA_DIR / CFG["paths"]["nominal_csv"]
-DIVIDEND_XLSX = DATA_DIR / CFG["paths"]["dividend_xlsx"]
-SHILLER_XLSX  = (_BASE / CFG["paths"]["shiller_xlsx"]).resolve()
-DGS1_XLSX     = (_BASE / CFG["paths"]["dgs1_xlsx"]).resolve()
-CHARTS_DIR    = _BASE / CFG["paths"]["charts_dir"]
-EXPORTS_DIR   = _BASE / CFG["paths"]["exports_dir"]
+SHILLER_IES_XLS = (_BASE / CFG["paths"]["shiller_ies_xls"]).resolve()
+SHILLER_IE_XLS = SHILLER_IES_XLS
+SHILLER_XLSX = (_BASE / CFG["paths"]["shiller_xlsx"]).resolve()
+DGS1_XLSX = (_BASE / CFG["paths"]["dgs1_xlsx"]).resolve()
+CHARTS_DIR = _BASE / CFG["paths"]["charts_dir"]
+EXPORTS_DIR = _BASE / CFG["paths"]["exports_dir"]
 
-EXPERIMENT_START     = CFG["experiment"]["start_date"]
+EXPERIMENT_START = CFG["experiment"]["start_date"]
 MONTHLY_CONTRIBUTION = float(CFG["experiment"]["monthly_contribution"])
-PERIOD_YEARS         = int(CFG["experiment"].get("period_years", 10))
+PERIOD_YEARS = int(CFG["experiment"].get("period_years", 10))
 
 CHARTS_DIR.mkdir(exist_ok=True)
 EXPORTS_DIR.mkdir(exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-def load_prices(csv_path: Path, start: str = EXPERIMENT_START) -> pd.Series:
-    """Load monthly S&P 500 prices; index normalised to month-end timestamps."""
-    df = pd.read_csv(csv_path, parse_dates=["Date"])
-    df = df.sort_values("Date").set_index("Date")["Value"]
-    df.index = df.index.to_period("M").to_timestamp("M")
-    return df[df.index >= start].rename(csv_path.stem)
+class GodBuy(NamedTuple):
+    date: pd.Timestamp
+    price: float
+    cash_deployed: float
+    period_label: str
 
 
-def load_dividends(xlsx_path: Path = DIVIDEND_XLSX) -> pd.Series:
-    """
-    Load monthly S&P 500 annual dividend yield (decimal, e.g. 0.0425 = 4.25%).
-    Index normalised to month-end timestamps to match load_prices output.
-    """
-    df = pd.read_excel(xlsx_path, usecols=["Date", "Value"])
-    df = df.sort_values("Date").set_index("Date")["Value"]
-    df.index = df.index.to_period("M").to_timestamp("M")
+def _parse_shiller_month(value: object) -> pd.Timestamp | None:
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    year = int(raw)
+    month = int(round((raw - year) * 100))
+    if not 1 <= month <= 12:
+        return None
+    return pd.Timestamp(year=year, month=month, day=1).to_period("M").to_timestamp("M")
+
+
+@lru_cache(maxsize=1)
+def _load_shiller_history() -> pd.DataFrame:
+    """Read Shiller ie_data.xls directly so old binary .xls support is explicit."""
+    book = xlrd.open_workbook(str(SHILLER_IES_XLS))
+    sheet = book.sheet_by_name("Data")
+    rows: list[tuple[pd.Timestamp, float, float, float, float]] = []
+
+    for row_idx in range(8, sheet.nrows):
+        date = _parse_shiller_month(sheet.cell_value(row_idx, 0))
+        if date is None:
+            continue
+        try:
+            nominal_price = float(sheet.cell_value(row_idx, 1))
+            cpi = float(sheet.cell_value(row_idx, 4))
+            real_price = float(sheet.cell_value(row_idx, 7))
+            real_tr = float(sheet.cell_value(row_idx, 9))
+        except (TypeError, ValueError):
+            continue
+        rows.append((date, nominal_price, cpi, real_price, real_tr))
+
+    if not rows:
+        raise ValueError(f"No Shiller monthly rows found in {SHILLER_IES_XLS}")
+
+    df = pd.DataFrame(
+        rows,
+        columns=["date", "nominal_price", "cpi", "real_price", "real_tr"],
+    ).set_index("date")
+    df = df.sort_index()
     df = df[~df.index.duplicated(keep="last")]
-    return df.rename("div_yield_annual")
+    return df
+
+
+def load_shiller_real_tr(start: str = EXPERIMENT_START) -> pd.Series:
+    """Load Shiller real total-return S&P 500, ie_data.xls column J."""
+    prices = _load_shiller_history()["real_tr"]
+    return prices[prices.index >= pd.Timestamp(start)].rename("shiller_real_tr")
+
+
+def load_cpi_series() -> pd.Series:
+    """Load Shiller CPI from ie_data.xls column E for the full available history."""
+    return _load_shiller_history()["cpi"].rename("cpi")
 
 
 def load_bond_yields(prices: pd.Series) -> pd.Series:
     """
-    Build a monthly 1-year T-bill yield series aligned to `prices`.
-      - 1930–1961: Shiller annual short rate (chapt26.xlsx), constant within each year
-      - 1962–2026: FRED DGS1 daily rates (DGS1.xlsx), averaged to calendar month
-    Returns annual yield in decimal (e.g. 0.035 = 3.5%).
+    Load nominal one-year cash yields aligned to Shiller monthly dates.
+
+    Shiller's pre-1962 one-year rate is used as an annual rate. FRED DGS1 is a
+    bond-equivalent yield, so it is converted to annual effective after monthly
+    averaging.
     """
-    # --- Shiller annual (1871–~2011): column R = One-Year Interest Rate ---
-    sh = pd.read_excel(SHILLER_XLSX, header=None, skiprows=8, usecols=[0, 4])
-    sh.columns = ["Year", "R"]
-    sh["Year"] = pd.to_numeric(sh["Year"], errors="coerce")
-    sh = sh.dropna(subset=["Year", "R"])
-    sh["Year"] = sh["Year"].astype(int)
+    shiller = pd.read_excel(SHILLER_XLSX, header=None, skiprows=8, usecols=[0, 4])
+    shiller.columns = ["year", "rate"]
+    shiller["year"] = pd.to_numeric(shiller["year"], errors="coerce")
+    shiller["rate"] = pd.to_numeric(shiller["rate"], errors="coerce")
+    shiller = shiller.dropna(subset=["year", "rate"])
 
-    # Expand annual → monthly (same rate applied to all 12 months of the year)
-    rows: list[tuple[pd.Timestamp, float]] = []
-    for _, row in sh.iterrows():
-        for m in range(1, 13):
-            ts = pd.Timestamp(year=int(row["Year"]), month=m, day=1).to_period("M").to_timestamp("M")
-            rows.append((ts, row["R"] / 100.0))
-    shiller_monthly = pd.Series(dict(rows), name="bond_yield")
+    annual_rows: list[tuple[pd.Timestamp, float]] = []
+    for row in shiller.itertuples(index=False):
+        for month in range(1, 13):
+            date = pd.Timestamp(int(row.year), month, 1).to_period("M").to_timestamp("M")
+            annual_rows.append((date, float(row.rate) / 100.0))
+    shiller_monthly = pd.Series(dict(annual_rows), name="nominal_tbill")
 
-    # --- FRED DGS1 daily → monthly average ---
     dgs1 = pd.read_excel(DGS1_XLSX, sheet_name="Daily")
     dgs1["observation_date"] = pd.to_datetime(dgs1["observation_date"])
-    dgs1 = dgs1.set_index("observation_date")["DGS1"]
-    dgs1 = pd.to_numeric(dgs1, errors="coerce")
-    dgs1_monthly = dgs1.resample("ME").mean()
-    dgs1_monthly.index = dgs1_monthly.index.to_period("M").to_timestamp("M")
-    dgs1_monthly = (dgs1_monthly / 100.0).rename("bond_yield")
+    fred = pd.to_numeric(dgs1.set_index("observation_date")["DGS1"], errors="coerce")
+    fred_monthly = fred.resample("ME").mean() / 100.0
+    fred_monthly.index = fred_monthly.index.to_period("M").to_timestamp("M")
+    fred_effective = ((1.0 + fred_monthly / 2.0) ** 2 - 1.0).rename("nominal_tbill")
 
-    # Shiller covers pre-1962; FRED covers 1962 onward
     cutoff = pd.Timestamp("1962-01-31")
-    combined = pd.concat([shiller_monthly[shiller_monthly.index < cutoff], dgs1_monthly])
+    combined = pd.concat([shiller_monthly[shiller_monthly.index < cutoff], fred_effective])
     combined = combined.sort_index()
     combined = combined[~combined.index.duplicated(keep="last")]
+    return combined.reindex(prices.index, method="ffill").bfill().rename("nominal_tbill")
 
-    return combined.reindex(prices.index, method="ffill").bfill().rename("bond_yield_annual")
+
+def load_real_tbill_yields(
+    prices: pd.Series,
+    cpi: pd.Series,
+    nominal_yields: pd.Series | None = None,
+) -> pd.Series:
+    """Convert nominal one-year yields to real annual yields with trailing 12m CPI."""
+    nominal = nominal_yields if nominal_yields is not None else load_bond_yields(prices)
+    nominal = nominal.reindex(prices.index, method="ffill").bfill()
+    trailing_inflation = cpi.sort_index() / cpi.sort_index().shift(12) - 1.0
+    trailing_inflation = trailing_inflation.reindex(prices.index, method="ffill").bfill()
+    real = (1.0 + nominal) / (1.0 + trailing_inflation) - 1.0
+    return real.rename("real_tbill")
 
 
-# ---------------------------------------------------------------------------
-# Decade helpers
-# ---------------------------------------------------------------------------
-def calendar_periods(prices: pd.Series, period_years: int = PERIOD_YEARS) -> list[pd.Series]:
+def maggiulli_global_bottoms(prices: pd.Series) -> dict[pd.Timestamp, str]:
     """
-    Split prices into fixed-length calendar periods of `period_years` years.
-    E.g. period_years=5 → 1925-1929, 1930-1934, 1935-1939, …
-    The last bucket covers whatever remains (e.g., 2025-2026).
+    Port of Maggiulli's two-pass drawdown bottom detection.
+
+    The schedule is meant to be computed once on the full series. Rolling
+    windows then filter this global schedule to dates inside each window.
     """
-    start_year    = prices.index[0].year
-    end_year      = prices.index[-1].year
-    period_start  = (start_year // period_years) * period_years
-    periods: list[pd.Series] = []
-
-    while period_start <= end_year:
-        mask  = (prices.index.year >= period_start) & (prices.index.year <= period_start + period_years - 1)
-        chunk = prices[mask]
-        if not chunk.empty:
-            periods.append(chunk)
-        period_start += period_years
-
-    return periods
-
-
-def inter_ath_troughs(prices: pd.Series) -> dict[pd.Timestamp, str]:
-    """
-    Perfect-foresight buy schedule: every inter-ATH trough (Maggiulli 2019 style).
-    Between each consecutive pair of ATH months, finds the month with the lowest
-    price. Returns {trough_date: 'YYYY-MM' label}.
-    Pairs with no months in between (back-to-back ATH months) are skipped.
-    """
-    running_max = -np.inf
-    ath_dates: list[pd.Timestamp] = []
-    for date, price in prices.items():
-        if price > running_max:
-            ath_dates.append(date)
+    drawdowns: list[float] = []
+    running_max = 0.0
+    for i, price in enumerate(prices.values):
+        if price < running_max and i != 0:
+            drawdowns.append(price / running_max - 1.0)
+        else:
+            drawdowns.append(0.0)
             running_max = price
 
-    buy_schedule: dict[pd.Timestamp, str] = {}
-    for i in range(len(ath_dates) - 1):
-        segment = prices.loc[ath_dates[i] : ath_dates[i + 1]].iloc[1:-1]
-        if segment.empty:
+    pct = np.array(drawdowns)
+    min_dd = np.zeros(len(pct))
+    local_min = 0.0
+    for i, value in enumerate(pct):
+        local_min = 0.0 if value == 0.0 else min(local_min, value)
+        min_dd[i] = local_min
+
+    local_min = 0.0
+    for i in range(len(pct) - 1, -1, -1):
+        if pct[i] == 0.0:
+            local_min = 0.0
+        else:
+            local_min = min(local_min, min_dd[i])
+            min_dd[i] = local_min
+
+    segments = pd.Series(pct == 0.0, index=prices.index).cumsum()
+    frame = pd.DataFrame({"pct": pct, "min_dd": min_dd, "segment": segments}, index=prices.index)
+
+    schedule: dict[pd.Timestamp, str] = {}
+    for _, chunk in frame.groupby("segment"):
+        hits = chunk[(chunk["min_dd"] < 0.0) & (chunk["pct"] == chunk["min_dd"])]
+        if hits.empty:
             continue
-        trough_date = segment.idxmin()
-        buy_schedule[trough_date] = trough_date.strftime("%Y-%m")
+        date = hits.index[0]
+        schedule[date] = date.strftime("%Y-%m")
+    return schedule
 
-    return buy_schedule
+
+def period_low_schedule(prices: pd.Series, period_years: int = PERIOD_YEARS) -> dict[pd.Timestamp, str]:
+    """
+    Buy once at the low of each period anchored to this series' start year.
+
+    This is window-relative for rolling windows: a window starting in 1947 uses
+    1947-1951, 1952-1956, and so on. It is not snapped to global Gregorian
+    decades unless the series itself starts on that boundary.
+    """
+    schedule: dict[pd.Timestamp, str] = {}
+    period_start = prices.index[0].year
+    end_year = prices.index[-1].year
+
+    while period_start <= end_year:
+        period_end = period_start + period_years - 1
+        chunk = prices[(prices.index.year >= period_start) & (prices.index.year <= period_end)]
+        if not chunk.empty:
+            date = chunk.idxmin()
+            schedule[date] = f"{period_start}-{period_end}"
+        period_start += period_years
+
+    return schedule
 
 
-# ---------------------------------------------------------------------------
-# Strategy: Dollar-Cost Averaging (with optional dividend reinvestment)
-# ---------------------------------------------------------------------------
 def run_dca(
     prices: pd.Series,
-    div_yields: pd.Series | None = None,
     monthly: float = MONTHLY_CONTRIBUTION,
 ) -> pd.Series:
-    """
-    DCA: invest `monthly` each month; optionally reinvest dividends (DRIP).
-
-    Each month:
-      1. Existing shares receive dividends  → shares *= (1 + annual_yield/12)
-      2. Buy new shares with the monthly contribution
-
-    div_yields=None → price-only mode (no dividend reinvestment).
-    """
-    yields = div_yields.reindex(prices.index, method="ffill").bfill() if div_yields is not None else None
     shares = 0.0
     values: list[float] = []
-
-    for i, (_, price) in enumerate(prices.items()):
-        if yields is not None:
-            shares *= 1.0 + yields.iloc[i] / 12.0
+    for price in prices.values:
         shares += monthly / price
         values.append(shares * price)
-
     return pd.Series(values, index=prices.index, name="DCA")
-
-
-# ---------------------------------------------------------------------------
-# Strategy: God (perfect foresight — one buy per decade at the decade low)
-# ---------------------------------------------------------------------------
-class GodBuy(NamedTuple):
-    date:         pd.Timestamp
-    price:        float
-    cash_deployed: float
-    decade_label: str
 
 
 def run_god(
     prices: pd.Series,
-    div_yields: pd.Series | None = None,
-    bond_yields: pd.Series | None = None,
+    cash_yields: pd.Series | None = None,
     monthly: float = MONTHLY_CONTRIBUTION,
     track_cash: bool = False,
-    _buy_schedule: dict[pd.Timestamp, str] | None = None,
+    buy_schedule: dict[pd.Timestamp, str] | None = None,
     period_years: int = PERIOD_YEARS,
 ) -> tuple[pd.Series, list[GodBuy]] | tuple[pd.Series, list[GodBuy], pd.Series]:
-    """
-    God: accumulates cash (earning 1-yr T-bill rate when bond_yields provided),
-    deploys ALL of it at each buy date. Invested shares earn DRIP dividends.
+    """Run God with an explicit buy schedule and explicit cash-yield series."""
+    schedule = buy_schedule if buy_schedule is not None else period_low_schedule(prices, period_years)
+    yields = None if cash_yields is None else cash_yields.reindex(prices.index, method="ffill").bfill()
 
-    Args:
-        bond_yields:    annual yield series (decimal) aligned to prices index.
-                        If None, idle cash earns 0%.
-        track_cash:     if True, return a third element (God's idle cash series).
-        _buy_schedule:  {date: label} override. If None, uses calendar_periods.
-                        Pass inter_ath_troughs(prices) for Maggiulli-style timing.
-        period_years:   calendar period length for the period-based strategy.
-                        Ignored when _buy_schedule is provided.
-
-    Returns (always):  (portfolio_series, buys)
-    Returns (track_cash=True): (portfolio_series, buys, cash_series)
-    """
-    yields = div_yields.reindex(prices.index, method="ffill").bfill() if div_yields is not None else None
-
-    if _buy_schedule is not None:
-        buy_dates = _buy_schedule
-    else:
-        buy_dates = {}
-        for chunk in calendar_periods(prices, period_years):
-            min_date = chunk.idxmin()
-            label    = f"{chunk.index[0].year}-{chunk.index[-1].year}"
-            buy_dates[min_date] = label
-
-    cash   = 0.0
+    cash = 0.0
     shares = 0.0
-    values:      list[float] = []
+    values: list[float] = []
     cash_values: list[float] = []
-    buys:        list[GodBuy] = []
+    buys: list[GodBuy] = []
 
     for i, (date, price) in enumerate(prices.items()):
         if yields is not None:
-            shares *= 1.0 + yields.iloc[i] / 12.0
-        if bond_yields is not None:
-            cash *= 1.0 + bond_yields.iloc[i] / 12.0
-
+            cash *= (1.0 + yields.iloc[i]) ** (1.0 / 12.0)
         cash += monthly
 
-        if date in buy_dates:
-            buys.append(GodBuy(date=date, price=price,
-                               cash_deployed=cash, decade_label=buy_dates[date]))
+        if date in schedule:
+            buys.append(GodBuy(date, float(price), float(cash), schedule[date]))
             shares += cash / price
-            cash    = 0.0
+            cash = 0.0
 
         values.append(shares * price + cash)
         cash_values.append(cash)
 
-    portfolio   = pd.Series(values,      index=prices.index, name="God")
+    portfolio = pd.Series(values, index=prices.index, name="God")
     cash_series = pd.Series(cash_values, index=prices.index, name="God_Cash")
-
     return (portfolio, buys, cash_series) if track_cash else (portfolio, buys)
 
 
-# ---------------------------------------------------------------------------
-# Decade-by-decade breakdown table
-# ---------------------------------------------------------------------------
 def decade_breakdown(
     prices: pd.Series,
     dca: pd.Series,
     god: pd.Series,
     buys: list[GodBuy],
+    period_years: int = PERIOD_YEARS,
 ) -> pd.DataFrame:
-    """Show each decade's God buy details and portfolio values at decade-end."""
-    buy_map = {b.decade_label: b for b in buys}
-    rows    = []
+    buy_map = {b.period_label: b for b in buys}
+    rows: list[dict[str, object]] = []
 
-    for chunk in calendar_periods(prices):
-        label     = f"{chunk.index[0].year}-{chunk.index[-1].year}"
-        last_date = chunk.index[-1]
-        dca_val   = dca.loc[last_date]
-        god_val   = god.loc[last_date]
-        buy       = buy_map.get(label)
+    period_start = prices.index[0].year
+    end_year = prices.index[-1].year
+    while period_start <= end_year:
+        period_end = period_start + period_years - 1
+        label = f"{period_start}-{period_end}"
+        period_prices = prices[
+            (prices.index.year >= period_start) & (prices.index.year <= period_end)
+        ]
+        if period_prices.empty:
+            period_start += period_years
+            continue
 
+        last_date = period_prices.index[-1]
+        buy = buy_map.get(label)
         rows.append({
-            "Decade":        label,
-            "God buys on":   buy.date.strftime("%b %Y")   if buy else "never",
-            "Buy price":     f"${buy.price:,.2f}"          if buy else "-",
-            "Cash deployed": f"${buy.cash_deployed:,.0f}"  if buy else "-",
-            "DCA value":     f"${dca_val:,.0f}",
-            "God value":     f"${god_val:,.0f}",
-            "Leader":        "God" if god_val > dca_val else "DCA",
+            "Period": label,
+            "God buys on": buy.date.strftime("%b %Y") if buy else "never",
+            "Buy price": f"${buy.price:,.2f}" if buy else "-",
+            "Cash deployed": f"${buy.cash_deployed:,.0f}" if buy else "-",
+            "DCA value": f"${dca.loc[last_date]:,.0f}",
+            "God value": f"${god.loc[last_date]:,.0f}",
+            "Leader": "God" if god.loc[last_date] > dca.loc[last_date] else "DCA",
         })
+        period_start += period_years
 
     return pd.DataFrame(rows)
 
 
-# ---------------------------------------------------------------------------
-# Single-strategy experiment (backward-compatible, used by export.py)
-# ---------------------------------------------------------------------------
-def run_experiment(label: str, csv_path: Path, div_yields: pd.Series,
-                   period_years: int = PERIOD_YEARS) -> dict:
-    """
-    Full pipeline for one price series with dividends and T-bill cash.
-    Returns a dict consumed by export.py and the legacy single-strategy notebook path.
-    """
-    prices      = load_prices(csv_path)
-    bond_yields = load_bond_yields(prices)
-    dca         = run_dca(prices, div_yields)
-    god, buys, god_cash = run_god(prices, div_yields, bond_yields,
-                                   track_cash=True, period_years=period_years)
-
-    final_dca         = dca.iloc[-1]
-    final_god         = god.iloc[-1]
-    total_contributed = MONTHLY_CONTRIBUTION * len(prices)
-    winner            = "God" if final_god > final_dca else "DCA"
-    god_advantage_pct = (final_god / final_dca - 1) * 100
-
-    print(f"\n{'='*60}")
-    print(f"  {label.upper()}  ({prices.index[0].strftime('%b %Y')} – {prices.index[-1].strftime('%b %Y')})")
-    print(f"{'='*60}")
-    print(f"  Total contributed (each):  ${total_contributed:>12,.0f}")
-    print(f"  DCA final portfolio:       ${final_dca:>12,.0f}")
-    print(f"  God final portfolio:       ${final_god:>12,.0f}")
-    print(f"  God vs DCA:               {god_advantage_pct:>+.1f}%")
-    print(f"  WINNER: {winner}")
-    print()
-    bd = decade_breakdown(prices, dca, god, buys)
-    print(bd.to_string(index=False))
-
-    return {
-        "label": label, "prices": prices, "dca": dca,
-        "god": god, "god_cash": god_cash, "buys": buys, "breakdown": bd,
-        "final_dca": final_dca, "final_god": final_god,
-        "total_contributed": total_contributed,
-        "winner": winner, "god_advantage_pct": god_advantage_pct,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Three-strategy experiment (canonical entry point for charts / notebook)
-# ---------------------------------------------------------------------------
 def run_all_strategies(
     prices: pd.Series,
-    div_yields: pd.Series,
     bond_yields: pd.Series,
-    label: str = "Nominal + Dividends",
+    cpi: pd.Series,
+    label: str = "Shiller Real Total Return",
 ) -> dict:
-    """
-    Run DCA + all three God strategies simultaneously on the same price series.
-    Strategies share identical dividends and T-bill cash assumptions.
+    real_cash_yields = load_real_tbill_yields(prices, cpi, bond_yields)
+    dca = run_dca(prices)
+    schedule_mag = maggiulli_global_bottoms(prices)
 
-    Returns a combined result dict consumed by charts.plot_all_multi and the
-    multi-strategy notebook cells.
-    """
-    dca = run_dca(prices, div_yields)
-
-    sched_mag        = inter_ath_troughs(prices)
-    god_mag,  buys_mag  = run_god(prices, div_yields, bond_yields, _buy_schedule=sched_mag)
-    god_5yr,  buys_5yr  = run_god(prices, div_yields, bond_yields, period_years=5)
-    god_10yr, buys_10yr = run_god(prices, div_yields, bond_yields, period_years=10)
+    god_mag_base, buys_mag_base, cash_mag_base = run_god(
+        prices, buy_schedule=schedule_mag, track_cash=True
+    )
+    god_mag, buys_mag, cash_mag = run_god(
+        prices, cash_yields=real_cash_yields, buy_schedule=schedule_mag, track_cash=True
+    )
+    god_5yr, buys_5yr, cash_5yr = run_god(
+        prices, cash_yields=real_cash_yields, period_years=5, track_cash=True
+    )
+    god_10yr, buys_10yr, cash_10yr = run_god(
+        prices, cash_yields=real_cash_yields, period_years=10, track_cash=True
+    )
 
     total = MONTHLY_CONTRIBUTION * len(prices)
 
-    def _adv(s: pd.Series) -> float:
-        return (s.iloc[-1] / dca.iloc[-1] - 1) * 100
+    def adv(series: pd.Series) -> float:
+        return (series.iloc[-1] / dca.iloc[-1] - 1.0) * 100.0
 
-    print(f"\n{'='*66}")
-    print(f"  {label.upper()}  ({prices.index[0].strftime('%b %Y')} – {prices.index[-1].strftime('%b %Y')})")
-    print(f"{'='*66}")
+    print(f"\n{'=' * 72}")
+    print(f"  {label.upper()}  ({prices.index[0].strftime('%b %Y')} - {prices.index[-1].strftime('%b %Y')})")
+    print(f"{'=' * 72}")
     print(f"  Total contributed (each):      ${total:>14,.0f}")
     print(f"  DCA final:                     ${dca.iloc[-1]:>14,.0f}")
-    print(f"  God Maggiulli final:           ${god_mag.iloc[-1]:>14,.0f}   ({_adv(god_mag):>+.1f}% vs DCA)  {len(buys_mag)} buys")
-    print(f"  God 5-Year final:              ${god_5yr.iloc[-1]:>14,.0f}   ({_adv(god_5yr):>+.1f}% vs DCA)  {len(buys_5yr)} buys")
-    print(f"  God 10-Year final:             ${god_10yr.iloc[-1]:>14,.0f}   ({_adv(god_10yr):>+.1f}% vs DCA)  {len(buys_10yr)} buys")
+    print(
+        f"  God Mag (0% cash) final:       ${god_mag_base.iloc[-1]:>14,.0f}"
+        f"   ({adv(god_mag_base):>+.1f}% vs DCA)  {len(buys_mag_base)} buys"
+    )
+    print(
+        f"  God Mag (real T-bill) final:   ${god_mag.iloc[-1]:>14,.0f}"
+        f"   ({adv(god_mag):>+.1f}% vs DCA)  {len(buys_mag)} buys"
+    )
+    print(
+        f"  God 5-Year final:              ${god_5yr.iloc[-1]:>14,.0f}"
+        f"   ({adv(god_5yr):>+.1f}% vs DCA)  {len(buys_5yr)} buys"
+    )
+    print(
+        f"  God 10-Year final:             ${god_10yr.iloc[-1]:>14,.0f}"
+        f"   ({adv(god_10yr):>+.1f}% vs DCA)  {len(buys_10yr)} buys"
+    )
 
     return {
-        "label":             label,
-        "prices":            prices,
-        "dca":               dca,
-        "god_mag":           god_mag,   "buys_mag":   buys_mag,
-        "god_5yr":           god_5yr,   "buys_5yr":   buys_5yr,
-        "god_10yr":          god_10yr,  "buys_10yr":  buys_10yr,
-        "final_dca":         dca.iloc[-1],
-        "final_mag":         god_mag.iloc[-1],
-        "final_5yr":         god_5yr.iloc[-1],
-        "final_10yr":        god_10yr.iloc[-1],
-        "adv_mag":           _adv(god_mag),
-        "adv_5yr":           _adv(god_5yr),
-        "adv_10yr":          _adv(god_10yr),
+        "label": label,
+        "prices": prices,
+        "bond_yields": bond_yields,
+        "real_cash_yields": real_cash_yields,
+        "dca": dca,
+        "god_mag_base": god_mag_base,
+        "god_mag": god_mag,
+        "god_5yr": god_5yr,
+        "god_10yr": god_10yr,
+        "cash_mag_base": cash_mag_base,
+        "cash_mag": cash_mag,
+        "cash_5yr": cash_5yr,
+        "cash_10yr": cash_10yr,
+        "buys_mag_base": buys_mag_base,
+        "buys_mag": buys_mag,
+        "buys_5yr": buys_5yr,
+        "buys_10yr": buys_10yr,
+        "final_dca": dca.iloc[-1],
+        "final_mag_base": god_mag_base.iloc[-1],
+        "final_mag": god_mag.iloc[-1],
+        "final_5yr": god_5yr.iloc[-1],
+        "final_10yr": god_10yr.iloc[-1],
+        "adv_mag_base": adv(god_mag_base),
+        "adv_mag": adv(god_mag),
+        "adv_5yr": adv(god_5yr),
+        "adv_10yr": adv(god_10yr),
         "total_contributed": total,
+        "breakdown": decade_breakdown(prices, dca, god_10yr, buys_10yr),
     }
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    prices      = load_prices(NOMINAL_CSV)
-    div_yields  = load_dividends()
+    prices = load_shiller_real_tr()
     bond_yields = load_bond_yields(prices)
-
-    result = run_all_strategies(prices, div_yields, bond_yields)
+    cpi = load_cpi_series()
+    result = run_all_strategies(prices, bond_yields, cpi)
 
     from charts import plot_all_multi
-    plot_all_multi(result)
 
-    print(f"\nCharts  -> {CHARTS_DIR}")
+    plot_all_multi(result)
+    print(f"\nCharts -> {CHARTS_DIR}")

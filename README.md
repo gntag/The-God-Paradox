@@ -32,8 +32,8 @@ This experiment replicates that baseline exactly, then extends it by letting God
 | **DCA** | — | $100/month, fully invested, no timing |
 | **God Maggiulli (0% cash)** | 0% | Every inter-ATH trough on the full series — exact Maggiulli 2019 replication |
 | **God Maggiulli (real T-bill)** | Real T-bill | Same buy schedule; idle cash earns Fisher real rate |
-| **God 5-Year** | Real T-bill | Once per 5-year calendar block, at the single lowest monthly price |
-| **God 10-Year** | Real T-bill | Once per calendar decade, at the single lowest monthly price |
+| **God 5-Year** | Real T-bill | Once per 5-year block anchored to the experiment/window start year |
+| **God 10-Year** | Real T-bill | Once per 10-year block anchored to the experiment/window start year |
 
 Every strategy contributes the same **$100/month**. God accumulates that cash (plus real interest) and deploys everything at once at the buy moment; DCA invests immediately every month.
 
@@ -113,17 +113,17 @@ CPI is sourced entirely from `ie_data.xls` — the same file as the price series
 
 **Rolling windows tell the more nuanced story:** Windows starting in the 1940s–1960s capture the full stagflation era (where real rates were often negative) but miss the Depression deflation bonus. In those windows, God's cash shrinks in real terms while waiting, reducing the deployed war chest and cutting the win rate significantly.
 
-**God 10-Year (47%) loses to DCA in the majority of rolling windows:** When each rolling window gets four full consecutive decades of accumulation (window-relative periods, not calendar-snapped), a decade of negative real rates is devastatingly punishing. The worst 10-Year window loses −32.3% to DCA; the median outcome is −1.9% (DCA wins on the median). The 5-Year strategy (70%) is far more robust because a 5-year wait through negative real rates is less damaging — the worst 5-Year window is only −13.2%.
+**God 10-Year (47%) loses to DCA in the majority of rolling windows:** Window-relative 10-year periods can expose the strategy to a full decade of weak or negative real cash returns before deployment, which is devastatingly punishing. The worst 10-Year window loses −32.3% to DCA; the median outcome is −1.9% (DCA wins on the median). The 5-Year strategy (70%) is far more robust because a 5-year wait through negative real rates is less damaging — the worst 5-Year window is only −13.2%.
 
 ---
 
 ## Prerequisites
 
 ```bash
-pip install pandas numpy matplotlib openpyxl pyyaml "xlrd<2.0"
+pip install pandas numpy matplotlib openpyxl pyyaml "xlrd>=2.0.1"
 ```
 
-> `xlrd < 2.0` is required to read Shiller's `.xls` file (the old binary Excel format). `xlrd >= 2.0` dropped `.xls` support.
+> `xlrd >= 2.0.1` reads Shiller's old binary `.xls` file. `.xlsx` files are handled by `openpyxl`.
 
 ---
 
